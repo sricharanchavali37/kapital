@@ -1,134 +1,130 @@
 """
 Pure functions. No DB. No Redis. No FastAPI.
-Input: portfolio state as plain dicts → Output: list of alert dicts.
-Testable with plain pytest in <2s, no infrastructure needed.
+Input dicts → output dicts. Testable with plain pytest, no infrastructure.
 """
 
-from app.config import (
-    DAILY_LOSS_LIMIT_PCT,
-    CONCENTRATION_STOCK_PCT,
-    CONCENTRATION_SECTOR_PCT,
-    STOP_LOSS_PCT,
-)
+from typing import Optional
 
 
-def check_daily_loss(
-    current_value: float,
-    open_value: float,
-) -> dict | None:
+def calculate_avg_cost(
+    existing_qty: float,
+    existing_avg: float,
+    new_qty: float,
+    new_price: float,
+) -> float:
     """
-    Rule 1: Portfolio drops >2% from today's opening value → HALTED.
-    Returns alert dict if breached, None if safe.
+    FIFO weighted average cost basis.
+    Buy 100 @ 195, then 100 @ 205 → avg = 200.00
     """
-    if open_value <= 0:
-        return None
-
-    drop_pct = ((open_value - current_value) / open_value) * 100
-
-    if drop_pct >= DAILY_LOSS_LIMIT_PCT:
-        return {
-            "rule_name": "DAILY_LOSS_LIMIT",
-            "symbol":    None,
-            "message":   f"Portfolio down {drop_pct:.2f}% today. Limit is {DAILY_LOSS_LIMIT_PCT}%. Trading HALTED.",
-            "severity":  "CRITICAL",
-        }
-    return None
+    if existing_qty + new_qty == 0:
+        return 0.0
+    return (existing_qty * existing_avg + new_qty * new_price) / (existing_qty + new_qty)
 
 
-def check_concentration(
+def calculate_position_pnl(
+    symbol: str,
+    quantity: float,
+    avg_cost: float,
+    current_price: float,
+    realized_pnl: float = 0.0,
+    is_stale: bool = False,
+) -> dict:
+    """
+    Returns P&L for a single position.
+    is_stale=True → data_warning included in response.
+    """
+    current_value  = current_price * quantity
+    cost_basis     = avg_cost * quantity
+    unrealized_pnl = current_value - cost_basis
+    unrealized_pct = (unrealized_pnl / cost_basis * 100) if cost_basis != 0 else 0.0
+
+    result = {
+        "symbol":             symbol,
+        "quantity":           quantity,
+        "avg_cost":           avg_cost,
+        "current_price":      current_price,
+        "current_value":      round(current_value, 2),
+        "cost_basis":         round(cost_basis, 2),
+        "unrealized_pnl":     round(unrealized_pnl, 2),
+        "unrealized_pnl_pct": round(unrealized_pct, 4),
+        "realized_pnl":       round(realized_pnl, 2),
+    }
+
+    if is_stale:
+        result["data_warning"] = "Price data is stale (>30s old). P&L may not reflect current market."
+
+    return result
+
+
+def calculate_portfolio_pnl(position_pnls: list[dict]) -> dict:
+    """
+    Aggregates individual position P&Ls into portfolio-level totals.
+    """
+    total_value      = sum(p["current_value"] for p in position_pnls)
+    total_unrealized = sum(p["unrealized_pnl"] for p in position_pnls)
+    total_realized   = sum(p["realized_pnl"] for p in position_pnls)
+    total_pnl        = total_unrealized + total_realized
+    total_cost_basis = sum(p["cost_basis"] for p in position_pnls)
+    total_pnl_pct    = (total_pnl / total_cost_basis * 100) if total_cost_basis != 0 else 0.0
+    any_stale        = any("data_warning" in p for p in position_pnls)
+
+    result = {
+        "portfolio_value":  round(total_value, 2),
+        "total_unrealized": round(total_unrealized, 2),
+        "total_realized":   round(total_realized, 2),
+        "total_pnl":        round(total_pnl, 2),
+        "total_pnl_pct":    round(total_pnl_pct, 4),
+        "position_count":   len(position_pnls),
+    }
+
+    if any_stale:
+        result["data_warning"] = "One or more prices are stale. Portfolio value may be inaccurate."
+
+    return result
+
+
+def calculate_sector_breakdown(
     position_pnls: list[dict],
     sector_map: dict,
-) -> list[dict]:
+) -> dict:
     """
-    Rule 2:
-    - Single stock  > 30% of portfolio → WARNING
-    - Single sector > 50% of portfolio → WARNING
-    Returns list of alert dicts (can be multiple breaches at once).
+    Groups positions by sector.
+    Returns sector name → {value, portfolio_pct, pnl, positions, status}
+
+    Input:  list of position P&L dicts (from calculate_position_pnl)
+    Output: dict of sector breakdowns
+
+    Pure function — no DB, no Redis, no imports from infrastructure.
     """
-    alerts = []
     total_value = sum(p["current_value"] for p in position_pnls)
 
-    if total_value <= 0:
-        return alerts
+    # Build sector buckets
+    sectors: dict[str, dict] = {}
 
-    # Stock concentration check
-    for p in position_pnls:
-        stock_pct = (p["current_value"] / total_value) * 100
-        if stock_pct > CONCENTRATION_STOCK_PCT:
-            alerts.append({
-                "rule_name": "CONCENTRATION_BREACH",
-                "symbol":    p["symbol"],
-                "message":   f"{p['symbol']} is {stock_pct:.1f}% of portfolio. Limit is {CONCENTRATION_STOCK_PCT}%.",
-                "severity":  "WARNING",
-            })
-
-    # Sector concentration check
-    sector_values: dict[str, float] = {}
     for p in position_pnls:
         sector = sector_map.get(p["symbol"], "Unknown")
-        sector_values[sector] = sector_values.get(sector, 0) + p["current_value"]
 
-    for sector, value in sector_values.items():
-        sector_pct = (value / total_value) * 100
-        if sector_pct > CONCENTRATION_SECTOR_PCT:
-            alerts.append({
-                "rule_name": "CONCENTRATION_BREACH",
-                "symbol":    None,
-                "message":   f"{sector} sector is {sector_pct:.1f}% of portfolio. Limit is {CONCENTRATION_SECTOR_PCT}%.",
-                "severity":  "WARNING",
-            })
+        if sector not in sectors:
+            sectors[sector] = {
+                "total_value": 0.0,
+                "total_pnl":   0.0,
+                "positions":   [],
+            }
 
-    return alerts
+        sectors[sector]["total_value"] += p["current_value"]
+        sectors[sector]["total_pnl"]   += p["unrealized_pnl"]
+        sectors[sector]["positions"].append(p["symbol"])
 
+    # Calculate percentages and status
+    result = {}
+    for sector, data in sectors.items():
+        pct = (data["total_value"] / total_value * 100) if total_value > 0 else 0.0
+        result[sector] = {
+            "total_value":   round(data["total_value"], 2),
+            "portfolio_pct": round(pct, 2),
+            "total_pnl":     round(data["total_pnl"], 2),
+            "positions":     data["positions"],
+            "status":        "WARNING" if pct > 50 else "NORMAL",
+        }
 
-def check_stop_loss(position_pnls: list[dict]) -> list[dict]:
-    """
-    Rule 3: Any position down >7% from avg_cost → WARNING.
-    Returns list of alert dicts.
-    """
-    alerts = []
-
-    for p in position_pnls:
-        if p["avg_cost"] <= 0:
-            continue
-
-        drop_pct = ((p["avg_cost"] - p["current_price"]) / p["avg_cost"]) * 100
-
-        if drop_pct >= STOP_LOSS_PCT:
-            alerts.append({
-                "rule_name": "STOP_LOSS_HIT",
-                "symbol":    p["symbol"],
-                "message":   f"{p['symbol']} is down {drop_pct:.1f}% from entry price of ${p['avg_cost']:.2f}.",
-                "severity":  "WARNING",
-            })
-
-    return alerts
-
-
-def run_all_rules(
-    position_pnls: list[dict],
-    portfolio_pnl: dict,
-    open_value: float,
-    sector_map: dict,
-) -> list[dict]:
-    """
-    Runs all 3 rules. Returns combined list of all alerts triggered.
-    This is the single entry point called by the price feed loop.
-    """
-    alerts = []
-
-    # Rule 1
-    daily_loss = check_daily_loss(
-        current_value=portfolio_pnl["portfolio_value"],
-        open_value=open_value,
-    )
-    if daily_loss:
-        alerts.append(daily_loss)
-
-    # Rule 2
-    alerts.extend(check_concentration(position_pnls, sector_map))
-
-    # Rule 3
-    alerts.extend(check_stop_loss(position_pnls))
-
-    return alerts
+    return result

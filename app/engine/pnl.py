@@ -83,3 +83,40 @@ def calculate_portfolio_pnl(position_pnls: list[dict]) -> dict:
         result["data_warning"] = "One or more prices are stale. Portfolio value may be inaccurate."
 
     return result
+
+
+def calculate_sector_breakdown(
+    position_pnls: list[dict],
+    sector_map: dict,
+) -> dict:
+    """
+    Breaks down portfolio by sector.
+    Aggregates values and P&L per sector, flags concentration risk.
+    """
+    total_value = sum(p["current_value"] for p in position_pnls)
+    sectors: dict[str, dict] = {}
+
+    for p in position_pnls:
+        sector = sector_map.get(p["symbol"], "Unknown")
+        if sector not in sectors:
+            sectors[sector] = {
+                "total_value": 0.0,
+                "total_pnl":   0.0,
+                "positions":   [],
+            }
+        sectors[sector]["total_value"] += p["current_value"]
+        sectors[sector]["total_pnl"]   += p["unrealized_pnl"]
+        sectors[sector]["positions"].append(p["symbol"])
+
+    result = {}
+    for sector, data in sectors.items():
+        pct = (data["total_value"] / total_value * 100) if total_value > 0 else 0.0
+        result[sector] = {
+            "total_value":   round(data["total_value"], 2),
+            "portfolio_pct": round(pct, 2),
+            "total_pnl":     round(data["total_pnl"], 2),
+            "positions":     data["positions"],
+            "status":        "WARNING" if pct > 50 else "NORMAL",
+        }
+
+    return result
