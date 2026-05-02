@@ -8,33 +8,40 @@ import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 from app.db.database import SessionLocal
-from app.db.models import Position
+from app.db.models import Position, PnLRecord
+from app.engine.pnl import calculate_position_pnl, calculate_portfolio_pnl
 
 load_dotenv()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380")
-FEED_INTERVAL = 5        # seconds between each fetch
-STALE_THRESHOLD = 30     # seconds before a price is considered stale
+FEED_INTERVAL = 5
+STALE_THRESHOLD = 30
 
 
-def get_open_symbols() -> list[str]:
-    """Read all open position symbols from Postgres."""
+def get_open_positions() -> list[dict]:
+    """Read all open positions from Postgres."""
     db = SessionLocal()
     try:
-        rows = db.query(Position.symbol).filter(Position.status == "OPEN").all()
-        return [r.symbol for r in rows]
+        rows = db.query(Position).filter(Position.status == "OPEN").all()
+        return [
+            {
+                "symbol":   p.symbol,
+                "quantity": p.quantity,
+                "avg_cost": p.avg_cost,
+            }
+            for p in rows
+        ]
     finally:
         db.close()
 
 
 def fetch_prices(symbols: list[str]) -> dict[str, float | None]:
     """
-    Call yfinance for a batch of symbols.
+    Fetch current prices from yfinance.
     Returns {symbol: price} — price is None if fetch failed.
     """
     if not symbols:
         return {}
-
     try:
         tickers = yf.Tickers(" ".join(symbols))
         result = {}
@@ -49,50 +56,115 @@ def fetch_prices(symbols: list[str]) -> dict[str, float | None]:
         return {s: None for s in symbols}
 
 
+def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
+    """
+    Write one PnLRecord row per position + one portfolio-level row.
+    Called after every price update cycle.
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+
+        # One row per position
+        for p in position_pnls:
+            db.add(PnLRecord(
+                symbol          = p["symbol"],
+                unrealized_pnl  = p["unrealized_pnl"],
+                realized_pnl    = p["realized_pnl"],
+                portfolio_value = p["current_value"],
+                calculated_at   = now,
+            ))
+
+        # One portfolio-level row (symbol=None)
+        db.add(PnLRecord(
+            symbol          = None,
+            unrealized_pnl  = portfolio_pnl["total_unrealized"],
+            realized_pnl    = portfolio_pnl["total_realized"],
+            portfolio_value = portfolio_pnl["portfolio_value"],
+            calculated_at   = now,
+        ))
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[pnl_record] Failed to save: {e}")
+    finally:
+        db.close()
+
+
 async def price_feed_loop():
     """
     Background loop — runs every 5 seconds.
-    Fetches prices for all open positions, writes to Redis.
-    Marks stale if fetch failed.
+    1. Fetch prices for all open positions → write to Redis
+    2. Calculate P&L for each position → write to Postgres (PnLRecord)
     """
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
-
     print("[price_feed] Started.")
 
     while True:
         try:
-            symbols = get_open_symbols()
+            positions = get_open_positions()
 
-            if not symbols:
+            if not positions:
                 await asyncio.sleep(FEED_INTERVAL)
                 continue
 
-            prices = fetch_prices(symbols)
-            now = datetime.now(timezone.utc).isoformat()
+            symbols = [p["symbol"] for p in positions]
+            prices  = fetch_prices(symbols)
+            now     = datetime.now(timezone.utc).isoformat()
 
+            # ── Step 1: Write prices to Redis ─────────────────────────────
             for symbol, price in prices.items():
                 is_stale = price is None
 
-                # If fetch failed, try to keep last known price but mark stale
                 if is_stale:
                     existing_raw = await r.get(f"price:{symbol}")
                     if existing_raw:
                         existing = json.loads(existing_raw)
-                        existing["is_stale"] = True
+                        existing["is_stale"]   = True
                         existing["fetched_at"] = now
                         await r.set(f"price:{symbol}", json.dumps(existing))
-                    # No previous price either — skip
                     continue
 
-                payload = {
+                await r.set(f"price:{symbol}", json.dumps({
                     "symbol":     symbol,
                     "price":      price,
                     "fetched_at": now,
                     "is_stale":   False,
-                }
-                await r.set(f"price:{symbol}", json.dumps(payload))
+                }))
 
-            print(f"[price_feed] Updated {len(prices)} symbols. {now}")
+            # ── Step 2: Calculate P&L and write to Postgres ───────────────
+            position_pnls = []
+            for p in positions:
+                symbol = p["symbol"]
+                price  = prices.get(symbol)
+
+                if price is None:
+                    # Try reading last known price from Redis
+                    raw = await r.get(f"price:{symbol}")
+                    if raw:
+                        price    = json.loads(raw)["price"]
+                        is_stale = True
+                    else:
+                        continue   # No price at all — skip this position
+
+                is_stale = prices.get(symbol) is None
+                pnl = calculate_position_pnl(
+                    symbol        = symbol,
+                    quantity      = p["quantity"],
+                    avg_cost      = p["avg_cost"],
+                    current_price = price,
+                    is_stale      = is_stale,
+                )
+                position_pnls.append(pnl)
+
+            if position_pnls:
+                portfolio_pnl = calculate_portfolio_pnl(position_pnls)
+                save_pnl_records(position_pnls, portfolio_pnl)
+                print(f"[price_feed] Updated {len(prices)} symbols. "
+                      f"Portfolio: ${portfolio_pnl['portfolio_value']:,.2f} | "
+                      f"P&L: ${portfolio_pnl['total_pnl']:,.2f} | "
+                      f"{now}")
 
         except Exception as e:
             print(f"[price_feed] Error: {e}")
