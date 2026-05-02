@@ -7,6 +7,7 @@ load_dotenv()
 
 from app.db.database import init_db
 from app.api.positions import router as positions_router
+from app.api.risk import router as risk_router   # ✅ added risk router import
 from app.services.price_feed import price_feed_loop
 
 
@@ -27,13 +28,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="kapital — Portfolio Risk Engine",
     description="Real-time P&L, risk rules, and stress testing for a 15-stock portfolio.",
-    version="0.2.0",
+    version="0.3.0",   # ✅ bumped version
     lifespan=lifespan,
 )
 
+# Routers
 app.include_router(positions_router)
+app.include_router(risk_router)   # ✅ added risk router
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}   # ✅ updated version
