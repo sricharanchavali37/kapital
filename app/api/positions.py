@@ -7,6 +7,7 @@ from app.db.database import get_db
 from app.db.models import Position, AuditLog
 from app.config import SECTOR_MAP
 from app.engine.pnl import calculate_avg_cost, calculate_position_pnl
+from app.services.alert_service import get_system_status   # ✅ added import
 
 router = APIRouter(prefix="/positions", tags=["positions"])
 
@@ -67,6 +68,13 @@ def add_position(payload: AddPositionRequest, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=400,
             detail=f"{symbol} is not in the tracked universe. Allowed: {list(SECTOR_MAP.keys())}"
+        )
+
+    # ✅ New HALTED system check
+    if get_system_status() == "HALTED":
+        raise HTTPException(
+            status_code=403,
+            detail="System is HALTED due to daily loss limit breach. No new positions allowed."
         )
 
     existing: Position | None = db.query(Position).filter(

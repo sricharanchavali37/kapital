@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 from app.db.database import SessionLocal
 from app.db.models import Position, PnLRecord
 from app.engine.pnl import calculate_position_pnl, calculate_portfolio_pnl
+from app.engine.rules import run_all_rules
+from app.services.alert_service import process_alerts
+from app.config import SECTOR_MAP
 
 load_dotenv()
 
@@ -19,7 +22,6 @@ STALE_THRESHOLD = 30
 
 
 def get_open_positions() -> list[dict]:
-    """Read all open positions from Postgres."""
     db = SessionLocal()
     try:
         rows = db.query(Position).filter(Position.status == "OPEN").all()
@@ -36,10 +38,6 @@ def get_open_positions() -> list[dict]:
 
 
 def fetch_prices(symbols: list[str]) -> dict[str, float | None]:
-    """
-    Fetch current prices from yfinance.
-    Returns {symbol: price} — price is None if fetch failed.
-    """
     if not symbols:
         return {}
     try:
@@ -57,15 +55,9 @@ def fetch_prices(symbols: list[str]) -> dict[str, float | None]:
 
 
 def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
-    """
-    Write one PnLRecord row per position + one portfolio-level row.
-    Called after every price update cycle.
-    """
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
-
-        # One row per position
         for p in position_pnls:
             db.add(PnLRecord(
                 symbol          = p["symbol"],
@@ -74,8 +66,6 @@ def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
                 portfolio_value = p["current_value"],
                 calculated_at   = now,
             ))
-
-        # One portfolio-level row (symbol=None)
         db.add(PnLRecord(
             symbol          = None,
             unrealized_pnl  = portfolio_pnl["total_unrealized"],
@@ -83,7 +73,6 @@ def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
             portfolio_value = portfolio_pnl["portfolio_value"],
             calculated_at   = now,
         ))
-
         db.commit()
     except Exception as e:
         db.rollback()
@@ -93,13 +82,9 @@ def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
 
 
 async def price_feed_loop():
-    """
-    Background loop — runs every 5 seconds.
-    1. Fetch prices for all open positions → write to Redis
-    2. Calculate P&L for each position → write to Postgres (PnLRecord)
-    """
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
     print("[price_feed] Started.")
+    system_status = {"halted": False}
 
     while True:
         try:
@@ -116,7 +101,6 @@ async def price_feed_loop():
             # ── Step 1: Write prices to Redis ─────────────────────────────
             for symbol, price in prices.items():
                 is_stale = price is None
-
                 if is_stale:
                     existing_raw = await r.get(f"price:{symbol}")
                     if existing_raw:
@@ -125,7 +109,6 @@ async def price_feed_loop():
                         existing["fetched_at"] = now
                         await r.set(f"price:{symbol}", json.dumps(existing))
                     continue
-
                 await r.set(f"price:{symbol}", json.dumps({
                     "symbol":     symbol,
                     "price":      price,
@@ -133,21 +116,18 @@ async def price_feed_loop():
                     "is_stale":   False,
                 }))
 
-            # ── Step 2: Calculate P&L and write to Postgres ───────────────
+            # ── Step 2: Calculate P&L ─────────────────────────────────────
             position_pnls = []
             for p in positions:
                 symbol = p["symbol"]
                 price  = prices.get(symbol)
-
                 if price is None:
-                    # Try reading last known price from Redis
                     raw = await r.get(f"price:{symbol}")
                     if raw:
                         price    = json.loads(raw)["price"]
                         is_stale = True
                     else:
-                        continue   # No price at all — skip this position
-
+                        continue
                 is_stale = prices.get(symbol) is None
                 pnl = calculate_position_pnl(
                     symbol        = symbol,
@@ -158,13 +138,42 @@ async def price_feed_loop():
                 )
                 position_pnls.append(pnl)
 
-            if position_pnls:
-                portfolio_pnl = calculate_portfolio_pnl(position_pnls)
-                save_pnl_records(position_pnls, portfolio_pnl)
-                print(f"[price_feed] Updated {len(prices)} symbols. "
-                      f"Portfolio: ${portfolio_pnl['portfolio_value']:,.2f} | "
-                      f"P&L: ${portfolio_pnl['total_pnl']:,.2f} | "
-                      f"{now}")
+            if not position_pnls:
+                await asyncio.sleep(FEED_INTERVAL)
+                continue
+
+            portfolio_pnl = calculate_portfolio_pnl(position_pnls)
+
+            # ── Step 3: Save P&L to Postgres ──────────────────────────────
+            save_pnl_records(position_pnls, portfolio_pnl)
+
+            # ── Step 4: Set opening value if not set today ─────────────────
+            open_value_raw = await r.get("portfolio:open_value")
+            if open_value_raw is None:
+                await r.set(
+                    "portfolio:open_value",
+                    portfolio_pnl["portfolio_value"]
+                )
+                open_value = portfolio_pnl["portfolio_value"]
+            else:
+                open_value = float(open_value_raw)
+
+            # ── Step 5: Run rules engine ───────────────────────────────────
+            alerts = run_all_rules(
+                position_pnls = position_pnls,
+                portfolio_pnl = portfolio_pnl,
+                open_value    = open_value,
+                sector_map    = SECTOR_MAP,
+            )
+            process_alerts(alerts, system_status)
+
+            print(
+                f"[price_feed] Updated {len(position_pnls)} symbols. "
+                f"Portfolio: ${portfolio_pnl['portfolio_value']:,.2f} | "
+                f"P&L: ${portfolio_pnl['total_pnl']:,.2f} | "
+                f"Alerts: {len(alerts)} | "
+                f"{now}"
+            )
 
         except Exception as e:
             print(f"[price_feed] Error: {e}")
