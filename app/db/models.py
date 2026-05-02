@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, Enum
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text
 from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime, timezone
 import enum
@@ -22,7 +22,7 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    symbol = Column(String(10), nullable=False, unique=True, index=True)
+    symbol = Column(String(10), nullable=False, index=True)  # updated: removed unique=True
     quantity = Column(Float, nullable=False)
     avg_cost = Column(Float, nullable=False)
     sector = Column(String(50), nullable=False)
