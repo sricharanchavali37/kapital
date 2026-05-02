@@ -4,16 +4,18 @@ from datetime import datetime, timezone
 
 import redis
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from app.db.database import get_db
-from app.db.models import Position, RiskAlert
+from app.db.models import Position, RiskAlert, AuditLog
 from app.engine.pnl import (
     calculate_position_pnl,
     calculate_portfolio_pnl,
     calculate_sector_breakdown,
 )
+from app.engine.stress import run_stress_test
 from app.config import SECTOR_MAP
 from app.services.alert_service import get_system_status
 
@@ -28,7 +30,6 @@ def _get_redis():
 
 
 def _read_price(r, symbol: str) -> tuple[float | None, bool]:
-    """Read price from Redis. Returns (price, is_stale)."""
     try:
         raw = r.get(f"price:{symbol}")
         if raw is None:
@@ -41,40 +42,31 @@ def _read_price(r, symbol: str) -> tuple[float | None, bool]:
 
 @router.get("/report")
 def get_risk_report(db: Session = Depends(get_db)):
-    """
-    Full portfolio health snapshot.
-    Reads positions from Postgres, prices from Redis,
-    calculates everything in memory, returns combined report.
-    """
     r = _get_redis()
 
-    # ── 1. Load open positions ─────────────────────────────────────────
     positions = db.query(Position).filter(Position.status == "OPEN").all()
 
     if not positions:
         return {
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
-            "status":          "ACTIVE",
-            "portfolio_value": 0.0,
-            "total_pnl":       0.0,
-            "total_pnl_pct":   0.0,
-            "message":         "No open positions.",
-            "active_alerts":   [],
-            "positions":       [],
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "status":           "ACTIVE",
+            "portfolio_value":  0.0,
+            "total_pnl":        0.0,
+            "total_pnl_pct":    0.0,
+            "message":          "No open positions.",
+            "active_alerts":    [],
+            "positions":        [],
             "sector_breakdown": {},
         }
 
-    # ── 2. Calculate P&L for each position ────────────────────────────
-    position_pnls  = []
-    any_stale      = False
-    last_updated   = None
+    position_pnls = []
+    any_stale     = False
+    last_updated  = None
 
     for p in positions:
         price, is_stale = _read_price(r, p.symbol)
-
         if price is None:
             continue
-
         if is_stale:
             any_stale = True
 
@@ -85,12 +77,9 @@ def get_risk_report(db: Session = Depends(get_db)):
             current_price = price,
             is_stale      = is_stale,
         )
-
-        # Add portfolio weight — needs total value, calculated after loop
         pnl["sector"] = p.sector
         position_pnls.append(pnl)
 
-        # Track last price update time
         try:
             raw = r.get(f"price:{p.symbol}")
             if raw:
@@ -102,32 +91,27 @@ def get_risk_report(db: Session = Depends(get_db)):
 
     if not position_pnls:
         return {
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
-            "status":          "ACTIVE",
-            "portfolio_value": 0.0,
-            "total_pnl":       0.0,
-            "total_pnl_pct":   0.0,
-            "message":         "Prices not yet available. Wait 5 seconds.",
-            "active_alerts":   [],
-            "positions":       [],
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "status":           "ACTIVE",
+            "portfolio_value":  0.0,
+            "total_pnl":        0.0,
+            "total_pnl_pct":    0.0,
+            "message":          "Prices not yet available. Wait 5 seconds.",
+            "active_alerts":    [],
+            "positions":        [],
             "sector_breakdown": {},
         }
 
-    # ── 3. Portfolio totals ────────────────────────────────────────────
     portfolio_pnl = calculate_portfolio_pnl(position_pnls)
     total_value   = portfolio_pnl["portfolio_value"]
 
-    # Add portfolio_weight_pct to each position
     for p in position_pnls:
         p["portfolio_weight_pct"] = round(
-            (p["current_value"] / total_value * 100) if total_value > 0 else 0.0,
-            2
+            (p["current_value"] / total_value * 100) if total_value > 0 else 0.0, 2
         )
 
-    # ── 4. Sector breakdown ────────────────────────────────────────────
     sector_breakdown = calculate_sector_breakdown(position_pnls, SECTOR_MAP)
 
-    # ── 5. Active alerts from Postgres ────────────────────────────────
     active_alerts = db.query(RiskAlert).filter(
         RiskAlert.is_active == True
     ).order_by(RiskAlert.last_fired_at.desc()).all()
@@ -143,13 +127,7 @@ def get_risk_report(db: Session = Depends(get_db)):
         for a in active_alerts
     ]
 
-    # ── 6. System status ───────────────────────────────────────────────
     system_status = get_system_status()
-
-    # Overall report status logic:
-    # HALTED   → daily loss limit breached
-    # WARNING  → any active alerts exist
-    # ACTIVE   → all clear
     if system_status == "HALTED":
         report_status = "HALTED"
     elif active_alerts:
@@ -157,7 +135,6 @@ def get_risk_report(db: Session = Depends(get_db)):
     else:
         report_status = "ACTIVE"
 
-    # ── 7. Build final response ────────────────────────────────────────
     return {
         "timestamp":       datetime.now(timezone.utc).isoformat(),
         "status":          report_status,
@@ -171,17 +148,99 @@ def get_risk_report(db: Session = Depends(get_db)):
         "active_alerts":   alerts_output,
         "positions": [
             {
-                "symbol":              p["symbol"],
-                "sector":              p.get("sector"),
-                "quantity":            p["quantity"],
-                "avg_cost":            p["avg_cost"],
-                "current_price":       p["current_price"],
-                "current_value":       p["current_value"],
-                "unrealized_pnl":      p["unrealized_pnl"],
-                "unrealized_pnl_pct":  p["unrealized_pnl_pct"],
-                "portfolio_weight_pct":p["portfolio_weight_pct"],
+                "symbol":               p["symbol"],
+                "sector":               p.get("sector"),
+                "quantity":             p["quantity"],
+                "avg_cost":             p["avg_cost"],
+                "current_price":        p["current_price"],
+                "current_value":        p["current_value"],
+                "unrealized_pnl":       p["unrealized_pnl"],
+                "unrealized_pnl_pct":   p["unrealized_pnl_pct"],
+                "portfolio_weight_pct": p["portfolio_weight_pct"],
             }
             for p in position_pnls
         ],
         "sector_breakdown": sector_breakdown,
     }
+
+
+# ── Stress Test ───────────────────────────────────────────────────────────────
+
+class StressTestRequest(BaseModel):
+    scenario_type: str = Field(
+        ...,
+        description="SECTOR_CRASH | MARKET_CRASH | SINGLE_STOCK"
+    )
+    target: str | None = Field(
+        None,
+        description="Sector name for SECTOR_CRASH, symbol for SINGLE_STOCK, null for MARKET_CRASH"
+    )
+    shock_pct: float = Field(
+        ...,
+        description="Shock percentage. Negative = drop. e.g. -20 means 20% crash."
+    )
+
+
+@router.post("/stress-test")
+def stress_test(payload: StressTestRequest, db: Session = Depends(get_db)):
+    r = _get_redis()
+
+    # Load open positions
+    positions = db.query(Position).filter(Position.status == "OPEN").all()
+    if not positions:
+        raise HTTPException(status_code=400, detail="No open positions to stress test.")
+
+    # Build positions list + current prices dict
+    positions_list  = []
+    current_prices  = {}
+
+    for p in positions:
+        price, is_stale = _read_price(r, p.symbol)
+        if price is None:
+            continue
+        positions_list.append({
+            "symbol":   p.symbol,
+            "quantity": p.quantity,
+            "avg_cost": p.avg_cost,
+        })
+        current_prices[p.symbol] = price
+
+    if not positions_list:
+        raise HTTPException(
+            status_code=400,
+            detail="No prices available yet. Wait 5 seconds and retry."
+        )
+
+    # Get today's opening value from Redis
+    open_value_raw = r.get("portfolio:open_value")
+    open_value     = float(open_value_raw) if open_value_raw else 0.0
+
+    # Run stress test — pure function, zero side effects
+    try:
+        result = run_stress_test(
+            positions      = positions_list,
+            current_prices = current_prices,
+            open_value     = open_value,
+            scenario_type  = payload.scenario_type,
+            target         = payload.target,
+            shock_pct      = payload.shock_pct,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Write one AuditLog row — only side effect allowed
+    db.add(AuditLog(
+        event_type  = "STRESS_TEST_RUN",
+        symbol      = None,
+        description = json.dumps({
+            "scenario":           result["scenario"],
+            "current_value":      result["current_value"],
+            "stressed_value":     result["stressed_value"],
+            "simulated_loss":     result["simulated_loss"],
+            "simulated_loss_pct": result["simulated_loss_pct"],
+            "rules_breached":     result["rules_breached"],
+        }),
+    ))
+    db.commit()
+
+    return result
