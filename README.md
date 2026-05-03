@@ -592,3 +592,50 @@ to question every assumption about the infrastructure, not just the code.
 
 | Energy | XOM, CVX |
 
+
+
+## Load Testing & Failure Simulation
+
+### Connection Pool Fix
+Initial load test (100 users) hit SQLAlchemy QueuePool limit — 
+default pool_size=10, max_overflow=20 was exhausted at ~85 concurrent users, 
+causing HTTP 500 errors. Fixed by setting pool_size=20, max_overflow=40, 
+pool_pre_ping=True. This is why load testing matters — the bug was invisible 
+under normal usage and only appeared under concurrent load.
+
+### Load Test Results (post-fix)
+Machine: Windows 10, 16GB RAM — weekend run (markets closed)
+Command: locust -u 100 -r 10 --run-time 60s
+
+| Endpoint             | Requests | p50  | p95    | Failures |
+|----------------------|----------|------|--------|----------|
+| GET /risk/report     | 1419     | 190ms| 5200ms | 0        |
+| GET /positions/      | 1075     | 250ms| 5200ms | 1        |
+| GET /risk/pnl-history| 727      | 150ms| 5000ms | 0        |
+| GET /risk/var        | 353      | 190ms| 5100ms | 0        |
+| POST /risk/stress-test| 704     | 190ms| 5100ms | 0        |
+| GET /health          | 350      | 58ms | 4700ms | 0        |
+
+Total: 5305 requests, 1 failure (0.02%), peak 110 RPS
+
+Note: p95 latencies are elevated because markets were closed during testing.
+yfinance returns no live prices on weekends, causing timeout fallbacks.
+p50 latencies reflect the true steady-state performance.
+
+VaR cache behavior confirmed: p50 of 190ms on /risk/var indicates Redis 
+cache hits. Cold cache (yfinance fetch) takes 2000-5000ms — only the 
+first request per 4-hour window pays this cost.
+
+### Failure Simulation — Redis Killed Mid-Run
+Baseline: /risk/report 200, /positions/ 200 — system healthy
+Redis killed: API became unresponsive (price feed loop exception propagated)
+Recovery: Full recovery within 8 seconds of Redis restart
+
+Root cause: Abrupt Redis termination caused the asyncio price feed loop to 
+throw an unhandled connection error that crashed the uvicorn worker process. 
+The fix would be a try/except with exponential backoff in price_feed.py 
+around the Redis write calls — currently the Redis reads are protected but 
+the write path is not.
+
+Recovery was automatic — Docker restart policy brought the worker back within 
+the 8-second window without any manual intervention.
