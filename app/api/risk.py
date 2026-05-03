@@ -1,9 +1,10 @@
+import asyncio
 import os
 import json
 from datetime import datetime, timezone, timedelta
 
 import redis
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -404,3 +405,105 @@ def get_value_at_risk(
     db.commit()
 
     return report
+
+
+# ── WebSocket Live Feed ───────────────────────────────────────────────────────
+
+@router.websocket("/ws/live")
+async def websocket_live_feed(websocket: WebSocket):
+    """
+    WebSocket endpoint that pushes a portfolio snapshot every 5 seconds.
+
+    Connect once. Data arrives automatically. No polling required.
+
+    How it works:
+      1. Client connects to ws://host/risk/ws/live
+      2. We create a personal asyncio.Queue for this client
+      3. We register the queue in CONNECTED_CLIENTS (main.py)
+      4. The price_feed_loop (running in background) puts a snapshot
+         into every queue in CONNECTED_CLIENTS after each cycle
+      5. We read from our queue and send JSON to the browser
+      6. On disconnect (browser closed / network drop), we remove
+         our queue from CONNECTED_CLIENTS so the feed stops sending
+
+    Message format:
+      {
+        "type": "price_update",
+        "timestamp": "2026-05-03T09:42:02Z",
+        "portfolio_value": 111711.30,
+        "total_pnl": 35241.00,
+        "total_unrealized": 35241.00,
+        "total_realized": 0.00,
+        "alert_count": 2,
+        "status": "ACTIVE",
+        "positions": [
+          {
+            "symbol": "JPM",
+            "current_price": 312.47,
+            "current_value": 93741.00,
+            "unrealized_pnl": 35241.00,
+            "unrealized_pnl_pct": 60.241,
+            "is_stale": false
+          },
+          ...
+        ]
+      }
+
+    On connect, sends an immediate acknowledgement so the client knows
+    the connection is live before the first price cycle fires.
+    """
+    # Import here to avoid circular import
+    # CONNECTED_CLIENTS lives in main.py which imports from this file
+    from app.main import CONNECTED_CLIENTS
+
+    await websocket.accept()
+
+    # Create a personal queue for this client
+    # maxsize=10: if client falls 10 messages behind, new ones are dropped
+    # This prevents unbounded memory growth if a client goes slow
+    client_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+
+    # Register this client
+    CONNECTED_CLIENTS.add(client_queue)
+
+    # Send immediate acknowledgement — client knows connection is live
+    await websocket.send_json({
+        "type": "connected",
+        "message": "kapital live feed connected. Updates every 5 seconds.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    try:
+        while True:
+            # Wait for the next snapshot from price_feed_loop
+            # timeout=30s: if no data in 30s, send a heartbeat so the
+            # connection doesn't get killed by proxies/load balancers
+            try:
+                snapshot = await asyncio.wait_for(
+                    client_queue.get(),
+                    timeout=30.0,
+                )
+                await websocket.send_json(snapshot)
+
+            except asyncio.TimeoutError:
+                # No price update in 30 seconds (market closed / weekend)
+                # Send heartbeat to keep connection alive
+                await websocket.send_json({
+                    "type": "heartbeat",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": "No price updates. Market may be closed.",
+                })
+
+    except WebSocketDisconnect:
+        # Browser tab closed, network dropped, or client disconnected cleanly
+        pass
+
+    except Exception as e:
+        # Unexpected error — log it, don't crash the server
+        print(f"[ws/live] Unexpected error: {e}")
+
+    finally:
+        # Always remove this client's queue on any exit path
+        # Without this, the price_feed_loop keeps trying to send
+        # to a dead queue forever
+        CONNECTED_CLIENTS.discard(client_queue)

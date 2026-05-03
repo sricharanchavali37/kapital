@@ -81,7 +81,7 @@ def save_pnl_records(position_pnls: list[dict], portfolio_pnl: dict):
         db.close()
 
 
-async def price_feed_loop():
+async def price_feed_loop(connected_clients: set | None = None):
     r = aioredis.from_url(REDIS_URL, decode_responses=True)
     print("[price_feed] Started.")
     system_status = {"halted": False}
@@ -174,6 +174,49 @@ async def price_feed_loop():
                 f"Alerts: {len(alerts)} | "
                 f"{now}"
             )
+
+            # ── Step 6: Broadcast to all connected WebSocket clients ───────
+            #
+            # Build a compact snapshot — only what a live dashboard needs.
+            # Not the full risk report (that's expensive to build every 5s).
+            # Just the numbers that change every cycle.
+            #
+            if connected_clients:
+                snapshot = {
+                    "type":            "price_update",
+                    "timestamp":       now,
+                    "portfolio_value": round(portfolio_pnl["portfolio_value"], 2),
+                    "total_pnl":       round(portfolio_pnl["total_pnl"], 2),
+                    "total_unrealized":round(portfolio_pnl["total_unrealized"], 2),
+                    "total_realized":  round(portfolio_pnl["total_realized"], 2),
+                    "alert_count":     len(alerts),
+                    "status":          "HALTED" if system_status.get("halted") else "ACTIVE",
+                    "positions": [
+                        {
+                            "symbol":           p["symbol"],
+                            "current_price":    round(p["current_price"], 4),
+                            "current_value":    round(p["current_value"], 2),
+                            "unrealized_pnl":   round(p["unrealized_pnl"], 2),
+                            "unrealized_pnl_pct": round(p["unrealized_pnl_pct"], 3),
+                            "is_stale":         p.get("data_warning", False),
+                        }
+                        for p in position_pnls
+                    ],
+                }
+                # Put into every client's queue.
+                # If a client queue is full (maxsize=10), skip it — don't block.
+                dead_clients = set()
+                for q in connected_clients:
+                    try:
+                        q.put_nowait(snapshot)
+                    except asyncio.QueueFull:
+                        # Client not consuming fast enough — skip this cycle
+                        pass
+                    except Exception:
+                        # Queue is broken — mark for removal
+                        dead_clients.add(q)
+                # Clean up dead queues
+                connected_clients -= dead_clients
 
         except Exception as e:
             print(f"[price_feed] Error: {e}")

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>kapital — live feed test</title>
+  <style>
+    body { font-family: monospace; background: #0a0e14; color: #c8d0e0; padding: 24px; }
+    h2   { color: #00e5a0; margin-bottom: 4px; }
+    #status { font-size: 13px; color: #7a8aaa; margin-bottom: 16px; }
+    #feed   { font-size: 12px; line-height: 1.8; }
+    .msg    { border-bottom: 1px solid #1e2a40; padding: 8px 0; }
+    .ts     { color: #4a5a7a; font-size: 11px; }
+    .val    { color: #00e5a0; font-weight: bold; }
+    .loss   { color: #ff4d6a; font-weight: bold; }
+    .label  { color: #7a8aaa; }
+  </style>
+</head>
+<body>
+  <h2>kapital — WebSocket Live Feed</h2>
+  <div id="status">Connecting...</div>
+  <div id="feed"></div>
+
+  <script>
+    const feedEl   = document.getElementById('feed');
+    const statusEl = document.getElementById('status');
+
+    // Change port here if you changed it in docker-compose
+    const ws = new WebSocket('ws://localhost:8100/risk/ws/live');
+
+    ws.onopen = () => {
+      statusEl.textContent = '● Connected — waiting for first update...';
+      statusEl.style.color = '#00e5a0';
+    };
+
+    ws.onclose = () => {
+      statusEl.textContent = '○ Disconnected';
+      statusEl.style.color = '#ff4d6a';
+    };
+
+    ws.onerror = (e) => {
+      statusEl.textContent = '✗ Connection error — is Docker running?';
+      statusEl.style.color = '#ff4d6a';
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      // Heartbeat — just update status, don't add to feed
+      if (data.type === 'heartbeat') {
+        statusEl.textContent = `● Connected — heartbeat at ${data.timestamp}`;
+        return;
+      }
+
+      // Connection ack
+      if (data.type === 'connected') {
+        statusEl.textContent = `● ${data.message}`;
+        return;
+      }
+
+      // Price update — render it
+      const pnl       = data.total_pnl;
+      const pnlClass  = pnl >= 0 ? 'val' : 'loss';
+      const pnlSign   = pnl >= 0 ? '+' : '';
+
+      // Build positions list
+      const posHtml = (data.positions || []).map(p => {
+        const cls  = p.unrealized_pnl >= 0 ? 'val' : 'loss';
+        const sign = p.unrealized_pnl >= 0 ? '+' : '';
+        const stale = p.is_stale ? ' ⚠ stale' : '';
+        return `&nbsp;&nbsp;${p.symbol}: $${p.current_price.toFixed(2)} &nbsp;|&nbsp; `
+             + `P&L: <span class="${cls}">${sign}$${p.unrealized_pnl.toFixed(2)} (${sign}${p.unrealized_pnl_pct.toFixed(2)}%)</span>`
+             + `${stale}`;
+      }).join('<br>');
+
+      const html = `
+        <div class="msg">
+          <div class="ts">${data.timestamp} &nbsp;|&nbsp; status: ${data.status} &nbsp;|&nbsp; alerts: ${data.alert_count}</div>
+          <div>
+            <span class="label">Portfolio: </span>
+            <span class="val">$${data.portfolio_value.toLocaleString()}</span>
+            &nbsp;&nbsp;
+            <span class="label">P&L: </span>
+            <span class="${pnlClass}">${pnlSign}$${pnl.toLocaleString()}</span>
+          </div>
+          <div>${posHtml}</div>
+        </div>
+      `;
+
+      // Prepend so newest is at top — max 20 messages shown
+      feedEl.insertAdjacentHTML('afterbegin', html);
+      const msgs = feedEl.querySelectorAll('.msg');
+      if (msgs.length > 20) msgs[msgs.length - 1].remove();
+    };
+  </script>
+</body>
+</html>
