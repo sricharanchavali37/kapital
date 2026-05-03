@@ -17,6 +17,8 @@ from app.engine.pnl import (
     calculate_sector_breakdown,
 )
 from app.engine.stress import run_stress_test
+from app.engine.var import build_var_report
+from app.services.var_data import get_historical_returns
 from app.config import SECTOR_MAP
 from app.services.alert_service import get_system_status
 
@@ -310,3 +312,95 @@ def get_pnl_history(
         "data_points": len(history),
         "history": history,
     }
+
+# ── Value at Risk ─────────────────────────────────────────────────────────────
+
+@router.get("/var")
+def get_value_at_risk(
+    confidence: float = 0.95,
+    db: Session = Depends(get_db),
+):
+    """
+    Computes Historical Simulation Value at Risk for the current portfolio.
+
+    Method: For each of the last 252 trading days, we simulate what the
+    portfolio would have made or lost if those exact market returns happened
+    today (using current position sizes). VaR is the loss at the chosen
+    confidence percentile.
+
+    Args:
+        confidence: 0.95 (default) or 0.99. Both are returned always.
+
+    Returns full VaR report including:
+      - VaR at 95% and 99% confidence (USD and %)
+      - Per-symbol standalone VaR breakdown
+      - Worst single historical day scenario
+      - Number of trading days used in calculation
+    """
+    # Validate confidence
+    if confidence not in (0.95, 0.99):
+        raise HTTPException(
+            status_code=400,
+            detail="confidence must be 0.95 or 0.99",
+        )
+
+    r = _get_redis()
+
+    # Load open positions
+    positions = db.query(Position).filter(Position.status == "OPEN").all()
+    if not positions:
+        raise HTTPException(status_code=400, detail="No open positions.")
+
+    # Build position_values: {symbol: current_dollar_value}
+    position_values: dict[str, float] = {}
+    for p in positions:
+        price, is_stale = _read_price(r, p.symbol)
+        if price is None:
+            continue
+        position_values[p.symbol] = round(price * p.quantity, 2)
+
+    if not position_values:
+        raise HTTPException(
+            status_code=400,
+            detail="No live prices available yet. Wait 5 seconds and retry.",
+        )
+
+    symbols = list(position_values.keys())
+
+    # Fetch historical returns (Redis-cached, falls back to yfinance)
+    historical_returns, dates = get_historical_returns(
+        symbols=symbols,
+        redis_client=r,
+    )
+
+    if not historical_returns:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not fetch historical price data from Yahoo Finance. "
+                "This may happen outside market hours or on weekends. "
+                "Try again later."
+            ),
+        )
+
+    # Build full report — pure engine call, no infrastructure
+    report = build_var_report(
+        position_values=position_values,
+        historical_returns=historical_returns,
+        dates=dates,
+        confidence_levels=[0.95, 0.99],
+    )
+
+    # Write to AuditLog
+    db.add(AuditLog(
+        event_type="VAR_CALCULATED",
+        symbol=None,
+        description=(
+            f"VaR calculated. Portfolio: ${report.get('portfolio_value', 0):,.2f}. "
+            f"Days used: {report.get('trading_days_used', 0)}. "
+            f"VaR 95%: {report.get('confidence_levels', {}).get('95%', {}).get('var_1day_usd', 'N/A')}."
+        ),
+    ))
+    db.commit()
+
+    return report
