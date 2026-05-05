@@ -1,0 +1,13 @@
+# Grafana datasource provisioning
+# This file runs automatically when Grafana starts.
+# It connects Grafana to Prometheus so no manual setup is needed.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

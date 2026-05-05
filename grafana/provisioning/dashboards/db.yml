@@ -1,0 +1,14 @@
+# Grafana dashboard provisioning
+# Tells Grafana to load dashboards from the /dashboards folder automatically.
+
+apiVersion: 1
+
+providers:
+  - name: kapital
+    orgId: 1
+    folder: "kapital"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

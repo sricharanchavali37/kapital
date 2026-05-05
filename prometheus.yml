@@ -1,0 +1,24 @@
+# Prometheus configuration for kapital
+#
+# Prometheus visits the API's /metrics endpoint every 15 seconds
+# and stores whatever numbers it finds there.
+#
+# Inside Docker Compose, services talk to each other by container name.
+# The API container is named "api" and runs on internal port 8000.
+# Prometheus is inside the same Docker network so it reaches "api:8000"
+# directly — NOT through localhost:8100 (that's the external port for your browser).
+
+global:
+  scrape_interval: 15s       # collect metrics every 15 seconds
+  evaluation_interval: 15s   # evaluate rules every 15 seconds
+
+scrape_configs:
+  - job_name: "kapital-api"
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: /metrics
+
+  - job_name: "prometheus-self"
+    static_configs:
+      - targets: ["localhost:9090"]
+    metrics_path: /metrics

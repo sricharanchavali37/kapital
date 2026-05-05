@@ -27,5 +27,49 @@ services:
       - "6380:6379"
     restart: on-failure
 
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # Scrapes /metrics from the API every 15 seconds.
+  # Stores all numbers with timestamps for Grafana to query.
+  # Accessible at http://localhost:9090 (raw query interface)
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - api
+    restart: on-failure
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  # Reads from Prometheus and renders the dashboard.
+  # Auto-provisioned: connects to Prometheus and loads kapital dashboard
+  # automatically on first startup. No manual setup needed.
+  # Open at http://localhost:3000
+  # Default login: admin / admin
+  grafana:
+    image: grafana/grafana:10.4.2
+    ports:
+      - "3100:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/kapital.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: on-failure
+
 volumes:
   pgdata:
+  prometheus_data:
+  grafana_data:
