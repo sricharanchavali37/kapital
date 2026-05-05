@@ -9,8 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
-# Expose FastAPI port
+# Expose default port (Railway overrides this with $PORT)
 EXPOSE 8000
 
-# Start uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Use $PORT if Railway sets it, otherwise fall back to 8000
+# --reload removed — that's for development only, not production
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
