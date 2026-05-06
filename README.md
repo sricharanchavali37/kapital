@@ -1,6 +1,13 @@
 \# kapital — Portfolio Risk Engine
 
 
+## Live Deployment
+**API Docs:** https://kapital-production-c2aa.up.railway.app/docs  
+**Risk Report:** https://kapital-production-c2aa.up.railway.app/risk/report  
+**Health:** https://kapital-production-c2aa.up.railway.app/health  
+**Metrics:** https://kapital-production-c2aa.up.railway.app/metrics
+
+
 
 A backend system that tracks a stock portfolio in real time, calculates 
 
